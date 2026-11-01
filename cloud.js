@@ -1,6 +1,8 @@
 (() => {
   const CONFIG_KEY = 'recover_cloud_config_v1';
   const BUCKET = 'recover-documents';
+  const AI_FUNCTION = 'recover-visual-ai';
+  const AI_CONSENT_KEY = 'recover_visual_ai_consent_v1';
   let client = null;
 
   function getConfig() {
@@ -149,10 +151,286 @@
     return true;
   }
 
+  async function visualAnalyze(payload) {
+    const c = init();
+    if (!c) throw new Error('Cloud non configuré.');
+    const session = await getSession();
+    if (!session) throw new Error('Connectez-vous avant d’utiliser l’IA visuelle.');
+    const { data, error } = await c.functions.invoke(AI_FUNCTION, { body: payload });
+    if (error) throw error;
+    if (!data?.analysis) throw new Error(data?.error || 'Réponse IA visuelle invalide.');
+    return data;
+  }
+
+  function aiConsentGranted() {
+    return localStorage.getItem(AI_CONSENT_KEY) === 'yes';
+  }
+
+  function requestAiConsent() {
+    if (aiConsentGranted()) return true;
+    const ok = window.confirm(
+      'Recover va envoyer une copie réduite des premières pages de cette facture, ainsi que le texte extrait, à l’IA via notre serveur Supabase. Le document peut contenir des données personnelles. Continuer ?'
+    );
+    if (ok) localStorage.setItem(AI_CONSENT_KEY, 'yes');
+    return ok;
+  }
+
+  function clearAiConsent() {
+    localStorage.removeItem(AI_CONSENT_KEY);
+  }
+
   window.RecoverCloud = {
     getConfig, setConfig, clearConfig, init, isConfigured, isReady,
     signUp, signIn, signOut, getSession, getUser,
     loadState, saveState, uploadDocument, getDocumentUrl, deleteDocument, testConnection,
-    bucket: BUCKET
+    visualAnalyze, aiConsentGranted, requestAiConsent, clearAiConsent,
+    bucket: BUCKET,
+    aiFunction: AI_FUNCTION
   };
+
+  // ---- IA visuelle de secours pour app.html ----
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  function fieldMissing(v) {
+    return v === null || v === undefined || v === '' || v === 'Non détecté' || v === 'Non détectée';
+  }
+
+  function suspiciousProduct(v) {
+    const s = String(v || '').toLowerCase();
+    return !s || /conditions? (générales? )?de vente|mentions? légales?|informatique et libertés|adresse de facturation|adresse de livraison|service client|merci de votre visite|facture total/.test(s);
+  }
+
+  function needsVisualFallback(p, text = '') {
+    if (!p) return false;
+    const c = p.confidence || {};
+    if ((c.merchant || 0) < 72 || (c.product || 0) < 72 || (c.price || 0) < 80 || (c.date || 0) < 70) return true;
+    if (suspiciousProduct(p.product)) return true;
+    if (p.documentType === 'Facture' && (fieldMissing(p.invoiceNumber) || fieldMissing(p.invoiceDate))) return true;
+    if (fieldMissing(p.price) || fieldMissing(p.merchant)) return true;
+    const n = String(text || '').toLowerCase();
+    if (n.includes('tva') && (fieldMissing(p.vatRate) || fieldMissing(p.vatAmount))) return true;
+    return false;
+  }
+
+  async function canvasDataUrl(canvas, quality = 0.82) {
+    return canvas.toDataURL('image/jpeg', quality);
+  }
+
+  async function imageFileToDataUrl(file) {
+    const raw = await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = reject;
+      r.readAsDataURL(file);
+    });
+    const img = await new Promise((resolve, reject) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = reject;
+      im.src = raw;
+    });
+    const max = 1800;
+    const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvasDataUrl(canvas);
+  }
+
+  async function previewImages(file) {
+    if (!file) return [];
+    if ((file.type || '').startsWith('image/')) return [await imageFileToDataUrl(file)];
+    if (file.type !== 'application/pdf' || !window.pdfjsLib) return [];
+    const buf = await file.arrayBuffer();
+    const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
+    const pages = [];
+    for (let i = 1; i <= Math.min(2, pdf.numPages); i++) {
+      const page = await pdf.getPage(i);
+      const viewport = page.getViewport({ scale: 1.55 });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+      pages.push(await canvasDataUrl(canvas, 0.8));
+    }
+    return pages;
+  }
+
+  function manualOverrides() {
+    const val = id => document.querySelector(id)?.value || '';
+    return {
+      merchant: val('#merchant'),
+      product: val('#product'),
+      price: val('#price') ? Number(val('#price')) : null,
+      purchaseDate: val('#purchase-date'),
+      orderNumber: val('#order-number'),
+      deliveryDate: val('#delivery-date')
+    };
+  }
+
+  function applyManual(p) {
+    const m = manualOverrides();
+    for (const [k, v] of Object.entries(m)) {
+      if (v !== '' && v !== null && v !== undefined) p[k] = v;
+    }
+    return p;
+  }
+
+  function mergeAi(local, ai) {
+    const out = JSON.parse(JSON.stringify(local || {}));
+    const conf = ai?.confidence || {};
+    const localConf = out.confidence || {};
+    const keyMap = {
+      merchant: 'merchant', product: 'product', price: 'price', purchaseDate: 'purchaseDate',
+      orderNumber: 'orderNumber', invoiceDate: 'invoiceDate', deliveryDate: 'deliveryDate',
+      shippingDate: 'shippingDate', dueDate: 'dueDate', invoiceNumber: 'invoiceNumber',
+      clientNumber: 'clientNumber', contractNumber: 'contractNumber', ht: 'ht',
+      vatRate: 'vatRate', vatAmount: 'vatAmount', vatNumber: 'vatNumber', seller: 'seller',
+      paymentReference: 'paymentReference', asin: 'asin', siret: 'siret', category: 'category',
+      documentType: 'documentType'
+    };
+
+    for (const [src, dst] of Object.entries(keyMap)) {
+      const value = ai?.[src];
+      if (value === null || value === undefined || value === '') continue;
+      const ac = Number(conf[src] || 0);
+      let should = fieldMissing(out[dst]);
+      if (src === 'product' && suspiciousProduct(out.product)) should = true;
+      if (src === 'category' || src === 'documentType') should = ac >= 75;
+      if (['merchant','product','price','purchaseDate','orderNumber'].includes(src)) {
+        const lc = Number(localConf[src === 'price' ? 'price' : src === 'purchaseDate' ? 'date' : src === 'orderNumber' ? 'order' : src] || 0);
+        if (ac >= 88 && ac >= lc - 5) should = true;
+      } else if (ac >= 82) {
+        should = true;
+      }
+      if (should) out[dst] = value;
+    }
+
+    out.confidence = { ...localConf };
+    if (conf.merchant) out.confidence.merchant = Math.max(out.confidence.merchant || 0, conf.merchant);
+    if (conf.product) out.confidence.product = Math.max(out.confidence.product || 0, conf.product);
+    if (conf.price) out.confidence.price = Math.max(out.confidence.price || 0, conf.price);
+    if (conf.purchaseDate || conf.invoiceDate) out.confidence.date = Math.max(out.confidence.date || 0, conf.purchaseDate || conf.invoiceDate || 0);
+    if (conf.orderNumber) out.confidence.order = Math.max(out.confidence.order || 0, conf.orderNumber);
+
+    out.enhanced = true;
+    out.aiUsed = true;
+    out.aiModel = ai?.model || '';
+    out.aiEvidence = ai?.evidence || {};
+    out.enhancedNotes = ['Vérification par IA visuelle'];
+
+    const extras = Array.isArray(out.genericFields) ? out.genericFields.slice() : [];
+    if (ai?.commercialWarrantyEnd) extras.push({ label: 'Garantie commerciale jusqu’au', value: ai.commercialWarrantyEnd });
+    if (ai?.legalWarrantyText) extras.push({ label: 'Garantie légale détectée', value: ai.legalWarrantyText });
+    out.genericFields = extras.filter((x, i, a) => x?.label && x?.value && a.findIndex(y => y.label === x.label && y.value === x.value) === i).slice(0, 30);
+    return applyManual(out);
+  }
+
+  function injectAiBanner(data) {
+    const content = document.querySelector('#result-content');
+    if (!content || content.querySelector('.recover-ai-visual-banner')) return;
+    const box = document.createElement('div');
+    box.className = 'enhanced-box recover-ai-visual-banner';
+    const model = data?.model ? ` · ${data.model}` : '';
+    box.innerHTML = `<strong>✨ IA visuelle utilisée${model}</strong><p>Recover a comparé directement l’image de la facture avec l’analyse locale. Les champs absents du document restent vides au lieu d’être inventés.</p>`;
+    content.prepend(box);
+  }
+
+  function addManualAiButton() {
+    const dlg = document.querySelector('#analysis-result-dialog');
+    if (!dlg?.open) return;
+    const actions = dlg.querySelector('.modal-actions') || dlg.querySelector('form') || dlg;
+    if (dlg.querySelector('#recover-ai-check')) return;
+    const btn = document.createElement('button');
+    btn.id = 'recover-ai-check';
+    btn.type = 'button';
+    btn.className = 'btn btn-secondary';
+    btn.textContent = '✨ Vérifier avec l’IA visuelle';
+    btn.addEventListener('click', () => runVisualAi(true));
+    actions.appendChild(btn);
+  }
+
+  let aiBusy = false;
+  let doneFingerprint = '';
+
+  function fingerprint(file) {
+    return file ? `${file.name}|${file.size}|${file.lastModified}` : '';
+  }
+
+  async function runVisualAi(force = false) {
+    if (aiBusy) return;
+    const file = document.querySelector('#file-input')?.files?.[0];
+    if (!file) return;
+    const fp = fingerprint(file);
+    if (!force && doneFingerprint === fp) return;
+
+    try {
+      const text = typeof window.extractFile === 'function' ? await window.extractFile(file) : '';
+      let local = window.RecoverParser?.parse ? window.RecoverParser.parse(text) : {};
+      if (typeof window.enhancedParse === 'function') local = window.enhancedParse(local, text).parsed;
+      local = applyManual(local);
+      if (!force && !needsVisualFallback(local, text)) return;
+      if (!requestAiConsent()) return;
+
+      aiBusy = true;
+      const button = document.querySelector('#recover-ai-check');
+      if (button) { button.disabled = true; button.textContent = '✨ IA visuelle en cours…'; }
+      const content = document.querySelector('#result-content');
+      if (content && !content.querySelector('#recover-ai-running')) {
+        const box = document.createElement('div');
+        box.id = 'recover-ai-running';
+        box.className = 'enhanced-box';
+        box.innerHTML = '<strong>✨ Vérification IA visuelle…</strong><p>Recover relit les premières pages du document et croise les résultats avec l’analyse locale.</p>';
+        content.prepend(box);
+      }
+
+      const images = await previewImages(file);
+      if (!images.length) throw new Error('Impossible de préparer un aperçu visuel du document.');
+      const result = await visualAnalyze({
+        fileName: file.name,
+        mimeType: file.type,
+        extractedText: String(text || '').slice(0, 24000),
+        localAnalysis: local,
+        images
+      });
+      const merged = mergeAi(local, { ...result.analysis, model: result.model });
+      doneFingerprint = fp;
+      const dlg = document.querySelector('#analysis-result-dialog');
+      if (dlg?.open) dlg.close();
+      if (typeof window.showResult === 'function') {
+        window.showResult(merged);
+        await sleep(0);
+        injectAiBanner(result);
+        addManualAiButton();
+      }
+    } catch (err) {
+      console.error('Recover IA visuelle:', err);
+      const running = document.querySelector('#recover-ai-running');
+      if (running) running.innerHTML = `<strong>⚠️ IA visuelle indisponible</strong><p>${String(err?.message || err)}</p>`;
+      const button = document.querySelector('#recover-ai-check');
+      if (button) { button.disabled = false; button.textContent = '✨ Réessayer avec l’IA visuelle'; }
+    } finally {
+      aiBusy = false;
+    }
+  }
+
+  function installVisualAiFallback() {
+    const dlg = document.querySelector('#analysis-result-dialog');
+    if (!dlg) return;
+    const observer = new MutationObserver(() => {
+      if (!dlg.open) return;
+      addManualAiButton();
+      const file = document.querySelector('#file-input')?.files?.[0];
+      if (!file || doneFingerprint === fingerprint(file)) return;
+      setTimeout(() => runVisualAi(false), 120);
+    });
+    observer.observe(dlg, { attributes: true, attributeFilter: ['open'] });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', installVisualAiFallback);
+  } else {
+    installVisualAiFallback();
+  }
 })();
