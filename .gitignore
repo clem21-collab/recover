@@ -1,0 +1,8 @@
+# Secrets / local environments
+.env
+.env.*
+supabase/functions/.env
+
+# Local/editor noise
+.DS_Store
+Thumbs.db
