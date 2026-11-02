@@ -277,6 +277,21 @@
     return p;
   }
 
+  function formatDateFr(value) {
+    const s = String(value || '').trim();
+    const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    return m ? `${m[3]}/${m[2]}/${m[1]}` : s;
+  }
+
+  function cleanGenericFields(fields) {
+    const noisy = /^(?:total|tva|ht|ttc|date|n[°o]?\s*(?:facture|client|commande|contrat)|siret|asin|référence\s*paiement|vendu\s*par|marchand|produit|catégorie|type\s*de\s*document)$/i;
+    return (Array.isArray(fields) ? fields : [])
+      .filter(x => x?.label && x?.value)
+      .filter(x => !noisy.test(String(x.label).trim()))
+      .filter((x, i, a) => a.findIndex(y => y.label === x.label && y.value === x.value) === i)
+      .slice(0, 12);
+  }
+
   function mergeAi(local, ai) {
     const out = JSON.parse(JSON.stringify(local || {}));
     const conf = ai?.confidence || {};
@@ -307,12 +322,25 @@
       if (should) out[dst] = value;
     }
 
+    // La date principale de Recover utilise purchaseDate. Sur une facture magasin,
+    // la date de facture est le meilleur repli lorsqu'aucune date de commande/achat n'existe.
+    if (fieldMissing(out.purchaseDate) && !fieldMissing(out.invoiceDate)) {
+      out.purchaseDate = out.invoiceDate;
+    }
+
+    // Quand le document ne distingue pas explicitement marchand et vendeur,
+    // le marchand confirmé par l'IA est un repli sûr pour « Vendu par ».
+    if (fieldMissing(out.seller) && !fieldMissing(out.merchant)) {
+      out.seller = out.merchant;
+    }
+
     out.confidence = { ...localConf };
     if (conf.merchant) out.confidence.merchant = Math.max(out.confidence.merchant || 0, conf.merchant);
     if (conf.product) out.confidence.product = Math.max(out.confidence.product || 0, conf.product);
     if (conf.price) out.confidence.price = Math.max(out.confidence.price || 0, conf.price);
     if (conf.purchaseDate || conf.invoiceDate) out.confidence.date = Math.max(out.confidence.date || 0, conf.purchaseDate || conf.invoiceDate || 0);
     if (conf.orderNumber) out.confidence.order = Math.max(out.confidence.order || 0, conf.orderNumber);
+    if (fieldMissing(ai?.seller) && conf.merchant) out.confidence.seller = Math.max(out.confidence.seller || 0, conf.merchant);
 
     out.enhanced = true;
     out.aiUsed = true;
@@ -320,10 +348,13 @@
     out.aiEvidence = ai?.evidence || {};
     out.enhancedNotes = ['Vérification par IA visuelle'];
 
-    const extras = Array.isArray(out.genericFields) ? out.genericFields.slice() : [];
-    if (ai?.commercialWarrantyEnd) extras.push({ label: 'Garantie commerciale jusqu’au', value: ai.commercialWarrantyEnd });
+    // Après une analyse IA structurée, on évite de réafficher les paires OCR brutes
+    // qui mélangeaient colonnes, adresses et fragments. On conserve seulement des extras utiles.
+    const extras = [];
+    if (ai?.commercialWarrantyEnd) extras.push({ label: 'Garantie commerciale jusqu’au', value: formatDateFr(ai.commercialWarrantyEnd) });
     if (ai?.legalWarrantyText) extras.push({ label: 'Garantie légale détectée', value: ai.legalWarrantyText });
-    out.genericFields = extras.filter((x, i, a) => x?.label && x?.value && a.findIndex(y => y.label === x.label && y.value === x.value) === i).slice(0, 30);
+    out.genericFields = cleanGenericFields(extras);
+
     return applyManual(out);
   }
 
@@ -351,6 +382,13 @@
     actions.appendChild(btn);
   }
 
+  function resetAiButton(success = false) {
+    const button = document.querySelector('#recover-ai-check');
+    if (!button) return;
+    button.disabled = false;
+    button.textContent = success ? '✨ Vérifier à nouveau avec l’IA visuelle' : '✨ Vérifier avec l’IA visuelle';
+  }
+
   let aiBusy = false;
   let doneFingerprint = '';
 
@@ -365,6 +403,7 @@
     const fp = fingerprint(file);
     if (!force && doneFingerprint === fp) return;
 
+    let succeeded = false;
     try {
       const text = typeof window.extractFile === 'function' ? await window.extractFile(file) : '';
       let local = window.RecoverParser?.parse ? window.RecoverParser.parse(text) : {};
@@ -396,6 +435,8 @@
       });
       const merged = mergeAi(local, { ...result.analysis, model: result.model });
       doneFingerprint = fp;
+      succeeded = true;
+
       const dlg = document.querySelector('#analysis-result-dialog');
       if (dlg?.open) dlg.close();
       if (typeof window.showResult === 'function') {
@@ -406,12 +447,14 @@
       }
     } catch (err) {
       console.error('Recover IA visuelle:', err);
+      doneFingerprint = '';
       const running = document.querySelector('#recover-ai-running');
       if (running) running.innerHTML = `<strong>⚠️ IA visuelle indisponible</strong><p>${String(err?.message || err)}</p>`;
       const button = document.querySelector('#recover-ai-check');
       if (button) { button.disabled = false; button.textContent = '✨ Réessayer avec l’IA visuelle'; }
     } finally {
       aiBusy = false;
+      if (succeeded) resetAiButton(true);
     }
   }
 
@@ -422,7 +465,7 @@
       if (!dlg.open) return;
       addManualAiButton();
       const file = document.querySelector('#file-input')?.files?.[0];
-      if (!file || doneFingerprint === fingerprint(file)) return;
+      if (!file || doneFingerprint === fingerprint(file) || aiBusy) return;
       setTimeout(() => runVisualAi(false), 120);
     });
     observer.observe(dlg, { attributes: true, attributeFilter: ['open'] });
