@@ -322,6 +322,36 @@
       if (should) out[dst] = value;
     }
 
+    // Les montants détaillés proviennent de champs structurés distincts : ne jamais
+    // supposer que « Total produits HT » est le total HT global de la facture.
+    const detailAmounts = ['itemsSubtotalHT', 'itemsSubtotalTTC', 'shippingTTC', 'discountTTC'];
+    for (const key of detailAmounts) {
+      if (!Object.prototype.hasOwnProperty.call(ai || {}, key)) continue;
+      const value = ai[key];
+      if (value === null || value === undefined) continue;
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) out[key] = value;
+    }
+    for (const key of ['paymentMethod', 'carrier', 'billingPeriod']) {
+      const value = ai?.[key];
+      if (typeof value === 'string' && value.trim()) out[key] = value.trim().slice(0, 180);
+    }
+    if (Array.isArray(ai?.lineItems)) {
+      out.lineItems = ai.lineItems.slice(0, 12).filter(item =>
+        item && typeof item.description === 'string' && item.description.trim()
+      ).map(item => ({
+        description: item.description.trim().slice(0, 240),
+        quantity: Number.isFinite(item.quantity) && item.quantity > 0 ? item.quantity : null,
+        totalTTC: Number.isFinite(item.totalTTC) && item.totalTTC >= 0 ? item.totalTTC : null
+      }));
+    }
+    // Si l'IA indique explicitement un sous-total produits HT, sans HT global,
+    // on retire l'ancien HT hérité de l'OCR lorsque des frais de port sont séparés.
+    if (ai?.ht === null && out.shippingTTC > 0 &&
+        typeof out.itemsSubtotalHT === 'number' &&
+        Math.abs(Number(out.ht) - out.itemsSubtotalHT) < 0.02) {
+      out.ht = null;
+    }
+
     // La date principale de Recover utilise purchaseDate. Sur une facture magasin,
     // la date de facture est le meilleur repli lorsqu'aucune date de commande/achat n'existe.
     if (fieldMissing(out.purchaseDate) && !fieldMissing(out.invoiceDate)) {
