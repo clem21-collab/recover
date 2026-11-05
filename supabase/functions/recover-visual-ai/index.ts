@@ -154,10 +154,11 @@ Retourne UNIQUEMENT un objet JSON valide avec exactement ces clés :
   }
 }`
 
-async function callGemini(apiKey: string, model: string, parts: any[]) {
+async function callGemini(apiKey: string, model: string, parts: any[], signal: AbortSignal) {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`
   const response = await fetch(endpoint, {
     method: 'POST',
+    signal,
     headers: {
       'x-goog-api-key': apiKey,
       'Content-Type': 'application/json',
@@ -183,31 +184,43 @@ function retryable(status: number) {
 async function analyzeWithFallback(apiKey: string, parts: any[]) {
   const configured = String(Deno.env.get('GEMINI_MODEL') || '').trim()
   const models = Array.from(new Set([configured, PRIMARY_MODEL, FALLBACK_MODEL].filter(Boolean)))
-  let lastStatus = 502
   let lastMessage = 'Gemini est indisponible.'
+  const deadline = AbortSignal.timeout(35_000)
 
   for (const model of models) {
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const { response, data } = await callGemini(apiKey, model, parts)
+      const { response, data } = await callGemini(apiKey, model, parts, deadline).catch(error => {
+        if (deadline.aborted) throw new Error('Gemini n’a pas répondu dans le délai imparti.')
+        throw error
+      })
+      if (deadline.aborted) throw new Error('Gemini n’a pas répondu dans le délai imparti.')
       if (response.ok) {
-        const text = responseText(data)
-        if (!text) throw new Error(`Gemini ${model} n’a renvoyé aucun résultat exploitable.`)
-        return { analysis: parseJsonOnly(text), model }
+        try {
+          const analysis = parseJsonOnly(responseText(data))
+          if (analysis && typeof analysis === 'object' && !Array.isArray(analysis) && Object.keys(analysis).length) {
+            return { analysis, model }
+          }
+        } catch { /* Essayer le modèle suivant si la sortie est inexploitable. */ }
+        lastMessage = `Gemini ${model} a renvoyé une analyse inexploitable.`
+        console.warn(lastMessage, data?.candidates?.[0]?.finishReason || data?.promptFeedback?.blockReason)
+        break
       }
 
-      lastStatus = response.status
-      lastMessage = data?.error?.message || `Erreur Gemini ${response.status}`
-      console.error(`Gemini ${model} attempt ${attempt} error ${response.status}`, data)
+      const upstreamStatus = data?.error?.status
+      const code = typeof upstreamStatus === 'string' && /^[A-Z_]{3,40}$/.test(upstreamStatus) ? ` · ${upstreamStatus}` : ''
+      lastMessage = `Gemini ${model} a renvoyé HTTP ${response.status}${code}.`
+      console.error(lastMessage, { attempt })
 
+      if (response.status === 404) break
       if (!retryable(response.status)) {
-        throw new Error(`Gemini ${model} ${response.status}: ${lastMessage}`)
+        throw new Error(lastMessage)
       }
 
       if (attempt < 2) await sleep(response.status === 503 ? 1400 : 800)
     }
   }
 
-  throw new Error(`Gemini indisponible après plusieurs tentatives (${lastStatus}): ${lastMessage}`)
+  throw new Error(lastMessage)
 }
 
 Deno.serve(async (req) => {
