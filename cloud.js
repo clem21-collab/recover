@@ -330,7 +330,11 @@
 
     // Quand le document ne distingue pas explicitement marchand et vendeur,
     // le marchand confirmé par l'IA est un repli sûr pour « Vendu par ».
-    if (fieldMissing(out.seller) && !fieldMissing(out.merchant)) {
+    // Une place de marché n'est pas nécessairement le vendeur du produit.
+    // Ne jamais renseigner « Vendu par Amazon » si aucun vendeur explicite n'a été identifié.
+    const merchantNormalized = String(out.merchant || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    const marketplace = /\b(?:amazon|cdiscount|fnac|rakuten|ebay|aliexpress|etsy|manomano|back market|vinted|la redoute)\b/.test(merchantNormalized);
+    if (fieldMissing(out.seller) && !fieldMissing(out.merchant) && !marketplace) {
       out.seller = out.merchant;
     }
 
