@@ -157,7 +157,16 @@
     const session = await getSession();
     if (!session) throw new Error('Connectez-vous avant d’utiliser l’IA visuelle.');
     const { data, error } = await c.functions.invoke(AI_FUNCTION, { body: payload });
-    if (error) throw error;
+    if (error) {
+      const response = error.context;
+      if (!response?.status || typeof response.clone !== 'function') throw error;
+      const body = await response.clone().json().catch(() => null);
+      const detail = [body?.error, body?.message, body?.msg].find(value => typeof value === 'string' && value.trim());
+      const plainText = response.headers.get('content-type')?.includes('text/plain')
+        ? await response.clone().text().catch(() => '') : '';
+      const message = (detail || plainText.trim() || response.statusText || error.message).slice(0, 500);
+      throw new Error(`HTTP ${response.status} · ${message}`, { cause: error });
+    }
     if (!data?.analysis) throw new Error(data?.error || 'Réponse IA visuelle invalide.');
     return data;
   }
@@ -450,7 +459,8 @@
       const button = document.querySelector('#recover-ai-check');
       if (button) { button.disabled = true; button.textContent = '✨ IA visuelle en cours…'; }
       const content = document.querySelector('#result-content');
-      if (content && !content.querySelector('#recover-ai-running')) {
+      if (content) {
+        content.querySelector('#recover-ai-running')?.remove();
         const box = document.createElement('div');
         box.id = 'recover-ai-running';
         box.className = 'enhanced-box';
@@ -482,8 +492,18 @@
     } catch (err) {
       console.error('Recover IA visuelle:', err);
       doneFingerprint = '';
-      const running = document.querySelector('#recover-ai-running');
-      if (running) running.innerHTML = `<strong>⚠️ IA visuelle indisponible</strong><p>${String(err?.message || err)}</p>`;
+      const content = document.querySelector('#result-content');
+      if (content) {
+        const banner = content.querySelector('#recover-ai-running') || document.createElement('div');
+        banner.id = 'recover-ai-running';
+        banner.className = 'enhanced-box';
+        const title = document.createElement('strong');
+        title.textContent = '⚠️ IA visuelle indisponible';
+        const detail = document.createElement('p');
+        detail.textContent = String(err?.message || err);
+        banner.replaceChildren(title, detail);
+        content.prepend(banner);
+      }
       const button = document.querySelector('#recover-ai-check');
       if (button) { button.disabled = false; button.textContent = '✨ Réessayer avec l’IA visuelle'; }
     } finally {

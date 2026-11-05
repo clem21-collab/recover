@@ -4,9 +4,9 @@ Recover utilise d'abord son analyse locale (PDF/OCR + parseur). Si des champs im
 
 ## Architecture
 
-Navigateur (GitHub Pages) → Supabase Edge Function `recover-visual-ai` → OpenAI Responses API
+Navigateur (GitHub Pages) → Supabase Edge Function `recover-visual-ai` → API Gemini
 
-La clé OpenAI ne doit jamais être placée dans GitHub Pages, `cloud.js`, `app.js` ou `setup.html`.
+Conservez la clé Gemini dans les secrets Supabase.
 
 ## 1. Créer la fonction dans Supabase
 
@@ -18,17 +18,15 @@ Dans le tableau de bord Supabase :
    `supabase/functions/recover-visual-ai/index.ts`
 4. Déployez la fonction.
 
-## 2. Ajouter la clé OpenAI dans Supabase
+## 2. Configurer Gemini dans Supabase
 
 Dans **Edge Functions → Secrets**, ajoutez :
 
-- `OPENAI_API_KEY` = votre clé API OpenAI
+- `GEMINI_API_KEY` = votre clé API Gemini. Réutilisez le secret existant s’il est déjà configuré.
 
 Optionnel :
 
-- `OPENAI_MODEL` = `gpt-4.1-mini`
-
-La clé API OpenAI est un secret serveur. Ne la commitez jamais dans GitHub.
+- `GEMINI_MODEL` permet de choisir le premier modèle essayé.
 
 ## 3. Fonctionnement dans Recover
 
@@ -45,6 +43,13 @@ Les factures peuvent contenir nom, adresse, téléphone et détails d'achat. Rec
 
 Pour retirer le consentement enregistré, effacez les données du site dans le navigateur. Une option dédiée pourra être ajoutée plus tard dans Mon compte.
 
-## 5. Coût
+## 5. Mise à jour et diagnostic
 
-L'utilisation de l'API OpenAI est facturée séparément d'un abonnement ChatGPT. La fonction n'appelle l'IA que comme solution de secours afin de limiter le coût.
+Après la publication du site, rechargez Recover. Dans Supabase, redéployez
+`recover-visual-ai` à partir de `supabase/functions/recover-visual-ai/index.ts`.
+Relancez ensuite **Vérifier avec l’IA visuelle** sur un document de test.
+
+En cas d’échec, Recover conserve l’analyse locale et affiche le statut HTTP
+ainsi que le détail disponible. Dans Supabase, consultez **Edge Functions →
+recover-visual-ai → Invocations** et **Logs** à l’heure de l’essai pour
+distinguer une erreur de la passerelle d’un échec signalé par Gemini.
