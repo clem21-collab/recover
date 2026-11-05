@@ -26,15 +26,17 @@ function safeGenericFields(rows,knownLabels){let out=[],seen=new Set(),known=kno
 for(const row of rows){if(row.cells.length===2){let [k,v]=row.cells;if(k.length>=2&&k.length<=55&&v.length<=160&&!/^(adresse de facturation|adresse de livraison)$/i.test(k))add(k,v)}for(const cell of row.cells){let m=cell.match(/^([^:：]{2,45})\s*[:：]\s*(.{1,140})$/);if(m)add(m[1],m[2]);}}
 return out.slice(0,30)}
 function parse(text){let rows=splitRows(text),all=rows.map(r=>r.raw.replace(/\t+/g,' ')).join('\n'),merchant=detectMerchant(rows);
-let purchase=dateValue(rows,['date de la commande','date commande','commande passée le','order date','date d’achat','date achat']);
+let purchase=dateValue(rows,['date de la commande','date de commande','date commande','commande passée le','order date','date d’achat','date achat']);
 let invoice=dateValue(rows,['date de la facture','date de facture','date facture','invoice date','émise le','emise le']);
 let shipping=dateValue(rows,['date d’expédition','date expedition','expédié le','expedie le','shipped']);
 let delivery=dateValue(rows,['date de la livraison','date de livraison','date de réception','date reception','livré le','livre le','reçu le','recu le']);
 let due=dateValue(rows,['date d’échéance','date echeance','échéance','echeance','due date']);
 let total=moneyValue(rows,['facture total','total ttc','net à payer','net a payer','montant total','total à payer','total a payer','total de la commande','total facture','grand total','amount due']);
+// Ne jamais prendre « Total Produits HT » ou « Total Taxes » pour le montant à payer.
+if(!total){for(const row of rows){let t=row.cells.join(' ');if(/^\s*total\s*[:：]\s*-?\d/i.test(t)||/^\s*total\s+-?\d/i.test(t)){let vals=t.match(/-?\d[\d .]*[,.]\d{2}\s*€?/g)||[];if(vals.length){total={value:amount(vals[vals.length-1])};break}}}}
 if(!total)total=moneyValue(rows,['total']);
 let ht=moneyValue(rows,['total ht','montant ht','hors taxe']);
-let vatAmount=moneyValue(rows,['montant tva','tva à payer','tva a payer','tax amount']);
+let vatAmount=moneyValue(rows,['montant tva','total taxes','total taxe','tva à payer','tva a payer','tax amount']);
 let vatRate=null;for(const r of rows){let s=r.cells.join(' '),m=s.match(/(?:taux\s+(?:de\s+)?)?tva\s*[:：]?\s*(\d{1,2}(?:[,.]\d+)?)\s*%/i);if(m){vatRate=+m[1].replace(',','.');break}m=s.match(/(\d{1,2}(?:[,.]\d+)?)\s*%\s*(?:tva|taxe)/i);if(m){vatRate=+m[1].replace(',','.');break}}
 let summary=findVatSummary(rows);if(summary){if(ht==null||ht.value===null)ht={value:summary.ht};if(vatAmount==null||vatAmount.value===null)vatAmount={value:summary.vatAmount};if(vatRate==null)vatRate=summary.vatRate}
 let vatNumber='';for(const r of rows){let s=r.cells.join(' '),m=s.match(/(?:n(?:um[ée]ro)?\s*)?(?:de\s*)?tva\s*(?:intracommunautaire)?\s*[:：]?\s*([A-Z]{2}[A-Z0-9 .-]{6,20})/i);if(m){let v=m[1].replace(/\s/g,'').replace(/[.,;:]$/,'');if(/[A-Z]/i.test(v)&&/\d/.test(v)){vatNumber=v;break}}}
