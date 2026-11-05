@@ -45,11 +45,25 @@ let seller=valueFromRow(rows,['vendu par','seller','vendeur'],v=>{let x=clean(v)
 let paymentReference=idValue(rows,['référence de paiement','reference de paiement','payment reference'],5);
 let asin=valueFromRow(rows,['asin'],v=>{let m=String(v||'').match(/\b[A-Z0-9]{8,14}\b/i);return m?m[0]:''},0);
 let siret='';let ms=all.match(/\bSIRET\s*[:：]?\s*(\d[\d ]{12,18})/i);if(ms)siret=ms[1].replace(/\s/g,'').slice(0,14);let siren='';ms=all.match(/\bSIREN\s*[:：]?\s*(\d[\d ]{7,12})/i);if(ms)siren=ms[1].replace(/\s/g,'').slice(0,9);
+// Sous-totaux explicites de produits : à ne pas confondre avec le total HT global.
+let itemsHT=moneyValue(rows,['total produits ht','sous-total produits ht','total articles ht']);
+let itemsTTC=moneyValue(rows,['total produits ttc','sous-total produits ttc','total articles ttc']);
+let shippingTTC=moneyValue(rows,["frais d'expédition","frais d’expédition","frais de livraison","frais de port","livraison ttc"]);
+let discountTTC=moneyValue(rows,['remise commerciale','remise appliquée','réduction totale']);
+let paymentMethod='';
+for(const row of rows){let raw=row.cells.join(' ');if(/moyen de paiement|mode de paiement/i.test(raw)){let m=raw.match(/\b(e-Transactions|PayPal|Carte bancaire|Carte bleue|Virement|Prélèvement|Apple Pay|Google Pay)\b/i);if(m){paymentMethod=m[1];break}}}
+let carrier='';
+const carrierMatch=all.match(/\b(Colissimo(?: Domicile(?: sans signature)?)?|Chronopost|Mondial Relay|Colis Privé|DHL|UPS|DPD|GLS|La Poste)\b/i);
+if(carrierMatch)carrier=carrierMatch[1];
+let billingPeriod='';
+const periodMatch=all.match(/\b(?:période|periode)\s+(?:de facturation\s+)?du\s+(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4})\s+au\s+(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4})/i);
+if(periodMatch)billingPeriod=periodMatch[1]+' au '+periodMatch[2];
+if(itemsHT&&shippingTTC&&shippingTTC.value>0&&ht&&Math.abs(ht.value-itemsHT.value)<0.02)ht=null;
 let product=extractProduct(rows),ord=orderNumber(rows);
 let confidence={merchant:merchant==='Prestataire non identifié'?38:88,product:product==='Achat / service'?35:92,price:total?92:35,date:purchase?94:invoice?82:35,order:ord?98:35};
 if(total&&ht&&vatAmount&&Math.abs((ht.value+vatAmount.value)-total.value)<0.03)confidence.price=99;else if(total&&vatRate!=null&&ht&&Math.abs(ht.value*(1+vatRate/100)-total.value)<0.08)confidence.price=98;
 const knownLabels=['type de document','catégorie','date facture','date de la facture','date expédition','date expedition','date réception','date reception','date livraison','date de la livraison','date échéance','date echeance','numéro de la facture','numero de la facture','numéro de facture','numero de facture','n° facture','numéro client','numero client','n° client','numéro contrat','numero contrat','n° contrat','total ht','montant ht','taux tva','montant tva','tva','siret','siren','date de la commande','numéro de la commande','numero de la commande','total à payer','total a payer','facture total','description','adresse de facturation','adresse de livraison','asin','vendu par','référence de paiement','reference de paiement'];
 let generic=safeGenericFields(rows,knownLabels);
-return{merchant,product,price:total?total.value:null,purchaseDate:purchase?purchase.value:(invoice?invoice.value:''),orderNumber:ord,documentType:docType(all),category:category(all),invoiceDate:invoice?invoice.value:'',shippingDate:shipping?shipping.value:'',deliveryDate:delivery?delivery.value:'',dueDate:due?due.value:'',invoiceNumber:invoiceNo?invoiceNo.value:'',clientNumber:clientNo?clientNo.value:'',contractNumber:contractNo?contractNo.value:'',ht:ht?ht.value:null,vatAmount:vatAmount?vatAmount.value:null,vatRate,vatNumber,siret,siren,seller:seller?seller.value:'',paymentReference:paymentReference?paymentReference.value:'',asin:asin?asin.value:'',confidence,genericFields:generic,rawText:all};}
+return{merchant,product,price:total?total.value:null,purchaseDate:purchase?purchase.value:(invoice?invoice.value:''),orderNumber:ord,documentType:docType(all),category:category(all),invoiceDate:invoice?invoice.value:'',shippingDate:shipping?shipping.value:'',deliveryDate:delivery?delivery.value:'',dueDate:due?due.value:'',invoiceNumber:invoiceNo?invoiceNo.value:'',clientNumber:clientNo?clientNo.value:'',contractNumber:contractNo?contractNo.value:'',ht:ht?ht.value:null,itemsSubtotalHT:itemsHT?itemsHT.value:null,itemsSubtotalTTC:itemsTTC?itemsTTC.value:null,shippingTTC:shippingTTC?shippingTTC.value:null,discountTTC:discountTTC?Math.abs(discountTTC.value):null,lineItems:[],paymentMethod,carrier,billingPeriod,vatAmount:vatAmount?vatAmount.value:null,vatRate,vatNumber,siret,siren,seller:seller?seller.value:'',paymentReference:paymentReference?paymentReference.value:'',asin:asin?asin.value:'',confidence,genericFields:generic,rawText:all};}
 window.RecoverParser={parse,isoDate,amount};
 })();
