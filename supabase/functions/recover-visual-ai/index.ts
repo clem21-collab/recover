@@ -185,15 +185,23 @@ async function analyzeWithFallback(apiKey: string, parts: any[]) {
   const configured = String(Deno.env.get('GEMINI_MODEL') || '').trim()
   const models = Array.from(new Set([configured, PRIMARY_MODEL, FALLBACK_MODEL].filter(Boolean)))
   let lastMessage = 'Gemini est indisponible.'
-  const deadline = AbortSignal.timeout(35_000)
+  const deadline = AbortSignal.timeout(50_000)
 
   for (const model of models) {
+    // Leave time for the fallback even when the first model hangs.
+    const modelDeadline = AbortSignal.timeout(model === models.at(-1) ? 25_000 : 12_000)
+    const signal = AbortSignal.any([deadline, modelDeadline])
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const { response, data } = await callGemini(apiKey, model, parts, deadline).catch(error => {
-        if (deadline.aborted) throw new Error('Gemini n’a pas répondu dans le délai imparti.')
+      const result = await callGemini(apiKey, model, parts, signal).catch(error => {
+        if (signal.aborted) return null
         throw error
       })
-      if (deadline.aborted) throw new Error('Gemini n’a pas répondu dans le délai imparti.')
+      if (signal.aborted || !result) {
+        lastMessage = `Gemini ${model} n’a pas répondu dans le délai imparti.`
+        console.warn(lastMessage, { attempt })
+        break
+      }
+      const { response, data } = result
       if (response.ok) {
         try {
           const analysis = parseJsonOnly(responseText(data))
@@ -218,6 +226,7 @@ async function analyzeWithFallback(apiKey: string, parts: any[]) {
 
       if (attempt < 2) await sleep(response.status === 503 ? 1400 : 800)
     }
+    if (deadline.aborted) break
   }
 
   throw new Error(lastMessage)
