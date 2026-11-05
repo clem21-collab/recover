@@ -60,7 +60,14 @@ Analyse DIRECTEMENT les images de la facture. Le texte OCR et l'analyse locale f
 Règles impératives :
 - N'invente JAMAIS une information absente du document. Si elle n'est pas explicitement présente, mets null.
 - Distingue date de commande, date de facture, date d'expédition, date de livraison/réception et date d'échéance.
-- Distingue Total TTC, Total HT, taux de TVA, montant de TVA et numéro de TVA intracommunautaire.
+- Distingue Total TTC payé, Total HT global, sous-totaux des produits HT/TTC, livraison TTC, remise TTC, TVA et numéro fiscal.
+- Un « Total produits HT » ne représente PAS le total HT de toute la facture si des frais de port s'y ajoutent. Dans ce cas itemsSubtotalHT contient cette valeur et ht reste null, sauf si un total HT global est explicitement indiqué.
+- Repère le transporteur, le moyen de paiement et la période facturée si et seulement si le document les mentionne.
+- Pour les factures de services ou d'abonnement, privilégie la vraie prestation et la période concernée plutôt qu'un article inventé.
+- Les frais de livraison/port n'appartiennent pas au sous-total des produits. shippingTTC est le montant des frais TTC affiché, discountTTC est une réduction positive lorsqu'elle est explicitement affichée.
+- lineItems liste uniquement les articles ou prestations réellement identifiables, avec quantité et total TTC s'ils sont visibles (max 12). Pas de ligne « conditions générales », total, taxe, remise ou livraison dans les articles.
+- Ne calcule aucun taux de TVA absent du document. Ne répartis pas la TVA entre produit et livraison sans indication explicite.
+- N'invente pas de valeur pour remplir l'équation total = produits + port - remise. Si les postes sont absents ou incohérents, laisse-les null.
 - Un numéro de TVA comme FR78347384570 ou EE102465501 n'est jamais un montant.
 - Le produit/service doit être la vraie ligne d'article ou prestation, jamais des conditions de vente, mentions légales, adresse, service client ou texte publicitaire.
 - S'il n'y a pas de numéro de commande, orderNumber = null.
@@ -93,6 +100,14 @@ Retourne UNIQUEMENT un objet JSON valide avec exactement ces clés :
   "clientNumber": string|null,
   "contractNumber": string|null,
   "ht": number|null,
+  "itemsSubtotalHT": number|null,
+  "itemsSubtotalTTC": number|null,
+  "shippingTTC": number|null,
+  "discountTTC": number|null,
+  "lineItems": [{"description": string, "quantity": number|null, "totalTTC": number|null}],
+  "paymentMethod": string|null,
+  "carrier": string|null,
+  "billingPeriod": string|null,
   "vatRate": number|null,
   "vatAmount": number|null,
   "vatNumber": string|null,
@@ -152,7 +167,7 @@ async function callGemini(apiKey: string, model: string, parts: any[]) {
       generationConfig: {
         responseMimeType: 'application/json',
         temperature: 0,
-        maxOutputTokens: 3500,
+        maxOutputTokens: 4500,
       },
     }),
   })
