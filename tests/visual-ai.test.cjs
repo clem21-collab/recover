@@ -35,21 +35,41 @@ test('Le client conserve une erreur réseau sans réponse HTTP', async () => {
   await assert.rejects(cloud.visualAnalyze({}), failure => failure === error);
 });
 
-function simulateGemini(responses) {
+function simulateGemini(responses, signals = AbortSignal) {
   const models = [];
   const env = { GEMINI_MODEL: 'configured-model' };
   const analyze = runInNewContext(functionSource + '\nanalyzeWithFallback', {
     Deno: { env: { get: key => env[key] }, serve() {} },
-    AbortSignal,
+    AbortSignal: signals,
     console: { error() {}, warn() {} },
-    fetch: async url => {
+    fetch: async (url, { signal }) => {
       models.push(url.match(/\/models\/([^:]+)/)[1]);
       assert.ok(responses.length, 'appel Gemini inattendu');
-      return responses.shift();
+      const response = responses.shift();
+      return typeof response === 'function' ? response(signal) : response;
     }
   });
   return { run: () => analyze('fake-key', []), models };
 }
+
+test('Un modèle trop lent laisse une tentative au modèle suivant', async () => {
+  const signals = {
+    timeout: ms => AbortSignal.timeout(ms === 12_000 ? 1 : ms),
+    any: AbortSignal.any
+  };
+  const simulation = simulateGemini([
+    signal => new Promise((resolve, reject) => {
+      const keepAlive = setTimeout(() => reject(new Error('Délai de test dépassé')), 1000);
+      signal.addEventListener('abort', () => {
+        clearTimeout(keepAlive);
+        reject(signal.reason);
+      }, { once: true });
+    }),
+    Response.json({ candidates: [{ content: { parts: [{ text: '{"price":19.9}' }] } }] })
+  ], signals);
+  assert.equal((await simulation.run()).analysis.price, 19.9);
+  assert.deepEqual(simulation.models, ['configured-model', 'gemini-3.8-flash']);
+});
 
 test('Gemini poursuit après un modèle introuvable et une analyse inexploitable', async () => {
   const simulation = simulateGemini([
