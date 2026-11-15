@@ -14,9 +14,9 @@ Dans le tableau de bord Supabase :
 
 1. Ouvrez **Edge Functions**.
 2. Créez une fonction nommée exactement `recover-visual-ai`.
-3. Remplacez son code par le contenu de :
-   `supabase/functions/recover-visual-ai/index.ts`
-4. Déployez la fonction.
+3. Mettez à jour les deux fichiers de la fonction et de sa validation partagée.
+   Conservez le chemin relatif de l’import dans `index.ts`.
+4. Déployez la fonction avec tous ses fichiers.
 
 ## 2. Configurer Gemini dans Supabase
 
@@ -46,10 +46,50 @@ Pour retirer le consentement enregistré, effacez les données du site dans le n
 ## 5. Mise à jour et diagnostic
 
 Après la publication du site, rechargez Recover. Dans Supabase, redéployez
-`recover-visual-ai` à partir de `supabase/functions/recover-visual-ai/index.ts`.
+`recover-visual-ai` avec ces deux fichiers du même commit.
+
+- `supabase/functions/recover-visual-ai/index.ts`
+- `supabase/functions/_shared/invoice-validation.js`
+
+Depuis une copie à jour du dépôt, la commande suivante inclut l’import partagé.
+
+```sh
+supabase functions deploy recover-visual-ai --project-ref otzlvluymgiepodlgsie
+```
+
+Le projet et la connexion Supabase doivent être configurés dans la CLI.
+Le tableau de bord reste utilisable si les deux fichiers sont ajoutés avec les
+mêmes chemins relatifs. Copier uniquement le nouveau `index.ts` laisse un import manquant.
+
+Le fichier `.nojekyll` permet à GitHub Pages de publier aussi le dossier
+`_shared` utilisé par le navigateur. Vérifiez que son fichier JavaScript est
+accessible après publication.
+
 Relancez ensuite **Vérifier avec l’IA visuelle** sur un document de test.
 
 En cas d’échec, Recover conserve l’analyse locale et affiche le statut HTTP
 ainsi que le détail disponible. Dans Supabase, consultez **Edge Functions →
 recover-visual-ai → Invocations** et **Logs** à l’heure de l’essai pour
 distinguer une erreur de la passerelle d’un échec signalé par Gemini.
+
+Le statut 429 interrompt les appels supplémentaires pour éviter une rafale
+sur un quota atteint. Les erreurs temporaires 503 sont réessayées dans les
+limites des délais par modèle et du délai global. Un en-tête Retry-After long
+est affiché pour permettre un nouvel essai ultérieur.
+
+## 6. Vérifications reproductibles
+
+Avec Node.js 24 ou ultérieur, lancez `node --test` à la racine du dépôt.
+Les tests exécutent le parseur, la fusion, l’état du bouton et la fonction serveur
+avec des réponses simulées. Les tests serveur utilisent le retrait des types
+TypeScript de Node.
+
+Amazon et Boulanger sont représentés par des textes reconstruits à partir des
+valeurs de référence, et Promovap par un extrait anonymisé représentatif. Ces tests
+ne vérifient pas le rendu ni l’OCR des PDF originaux. Un extrait de texte Promovap
+conservé de l’essai précédent a également été contrôlé localement. Il ne contient
+pas de preuve du fonctionnement actuel de Gemini en production.
+
+Avant une ouverture publique, refaire un essai réel dans Recover après le
+déploiement Supabase, puis contrôler la connexion, la sauvegarde cloud et les
+parcours de garanties, retours et remboursements sur un compte de test.

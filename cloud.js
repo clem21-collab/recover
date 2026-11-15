@@ -165,9 +165,12 @@
       const plainText = response.headers.get('content-type')?.includes('text/plain')
         ? await response.clone().text().catch(() => '') : '';
       const message = (detail || plainText.trim() || response.statusText || error.message).slice(0, 500);
-      throw new Error(`HTTP ${response.status} · ${message}`, { cause: error });
+      const wait = typeof body?.retryAfter === 'number' && body.retryAfter > 0
+        ? ' Réessayez après ' + body.retryAfter + ' secondes.' : '';
+      throw new Error(`HTTP ${response.status} · ${message}` + wait, { cause: error });
     }
     if (!data?.analysis) throw new Error(data?.error || 'Réponse IA visuelle invalide.');
+    globalThis.RecoverInvoiceValidation.validateAnalysis(data.analysis);
     return data;
   }
 
@@ -201,12 +204,12 @@
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   function fieldMissing(v) {
-    return v === null || v === undefined || v === '' || v === 'Non détecté' || v === 'Non détectée';
+    return v === null || v === undefined || v === '' || v === 'Non détecté' || v === 'Non détectée' || v === 'Prestataire non identifié' || v === 'Achat / service';
   }
 
   function suspiciousProduct(v) {
     const s = String(v || '').toLowerCase();
-    return !s || /conditions? (générales? )?de vente|mentions? légales?|informatique et libertés|adresse de facturation|adresse de livraison|service client|merci de votre visite|facture total/.test(s);
+    return !globalThis.RecoverInvoiceValidation.validProduct(v) || /conditions? (générales? )?de vente|mentions? légales?|informatique et libertés|adresse de facturation|adresse de livraison|service client|merci de votre visite|facture total/.test(s);
   }
 
   function needsVisualFallback(p, text = '') {
@@ -281,7 +284,11 @@
   function applyManual(p) {
     const m = manualOverrides();
     for (const [k, v] of Object.entries(m)) {
-      if (v !== '' && v !== null && v !== undefined) p[k] = v;
+      if (v !== '' && v !== null && v !== undefined) {
+        p[k] = v;
+        p.fieldSources = { ...p.fieldSources, [k]: 'manual' };
+        p.fieldConfidence = { ...p.fieldConfidence, [k]: 95 };
+      }
     }
     return p;
   }
@@ -301,103 +308,76 @@
       .slice(0, 12);
   }
 
-  function mergeAi(local, ai) {
+  function mergeAi(local, input) {
+    const ai = globalThis.RecoverInvoiceValidation.validateAnalysis(input);
     const out = JSON.parse(JSON.stringify(local || {}));
-    const conf = ai?.confidence || {};
-    const localConf = out.confidence || {};
-    const keyMap = {
-      merchant: 'merchant', product: 'product', price: 'price', purchaseDate: 'purchaseDate',
-      orderNumber: 'orderNumber', invoiceDate: 'invoiceDate', deliveryDate: 'deliveryDate',
-      shippingDate: 'shippingDate', dueDate: 'dueDate', invoiceNumber: 'invoiceNumber',
-      clientNumber: 'clientNumber', contractNumber: 'contractNumber', ht: 'ht',
-      vatRate: 'vatRate', vatAmount: 'vatAmount', vatNumber: 'vatNumber', seller: 'seller',
-      paymentReference: 'paymentReference', asin: 'asin', siret: 'siret', category: 'category',
-      documentType: 'documentType'
-    };
-
-    for (const [src, dst] of Object.entries(keyMap)) {
-      const value = ai?.[src];
-      if (value === null || value === undefined || value === '') continue;
-      const ac = Number(conf[src] || 0);
-      let should = fieldMissing(out[dst]);
-      if (src === 'product' && suspiciousProduct(out.product)) should = true;
-      if (src === 'category' || src === 'documentType') should = ac >= 75;
-      if (['merchant','product','price','purchaseDate','orderNumber'].includes(src)) {
-        const lc = Number(localConf[src === 'price' ? 'price' : src === 'purchaseDate' ? 'date' : src === 'orderNumber' ? 'order' : src] || 0);
-        if (ac >= 88 && ac >= lc - 5) should = true;
-      } else if (ac >= 82) {
-        should = true;
+    const validation = globalThis.RecoverInvoiceValidation;
+    const aliases = { purchaseDate: 'date', orderNumber: 'order' };
+    out.confidence = { ...out.confidence };
+    out.fieldConfidence = { ...out.fieldConfidence };
+    out.fieldSources = { ...out.fieldSources };
+    out.fieldConflicts = [];
+    for (const [key, value] of Object.entries(ai)) {
+      if (['confidence', 'evidence', 'validationWarnings', 'lineItems'].includes(key) || value === null)
+        continue;
+      const ac = ai.confidence[key] || 0;
+      if (ac < 75) continue;
+      const alias = aliases[key] || key;
+      const existing = out[key];
+      const missing = fieldMissing(existing) || (key === 'product' && suspiciousProduct(existing));
+      const lc = out.fieldConfidence[key] ?? out.confidence[alias] ?? 75;
+      const same =
+        String(existing ?? '')
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .toLowerCase()
+          .trim() ===
+        String(value)
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .toLowerCase()
+          .trim();
+      const evidence =
+        ai.evidence[key] || (['ht', 'vatRate', 'vatAmount'].includes(key) ? ai.evidence.vat : '');
+      if (!missing && !same) {
+        out.fieldConflicts.push({ field: key, local: existing, ai: value });
+        out.fieldConfidence[key] = Math.min(60, lc);
+        out.confidence[alias] = Math.min(60, lc);
       }
-      if (should) out[dst] = value;
+      if (missing || same || (ac >= 88 && ac >= lc && evidence) || (lc < 70 && ac >= 80 && evidence)) {
+        out[key] = value;
+        const confidence = !missing && !same ? 60 : same ? Math.min(95, Math.max(lc, ac)) : ac;
+        out.fieldConfidence[key] = confidence;
+        out.confidence[alias] = confidence;
+        out.fieldSources[key] = same ? 'local+ai' : 'ai';
+      }
     }
-
-    // Les montants détaillés proviennent de champs structurés distincts : ne jamais
-    // supposer que « Total produits HT » est le total HT global de la facture.
-    const detailAmounts = ['itemsSubtotalHT', 'itemsSubtotalTTC', 'shippingTTC', 'discountTTC'];
-    for (const key of detailAmounts) {
-      if (!Object.prototype.hasOwnProperty.call(ai || {}, key)) continue;
-      const value = ai[key];
-      if (value === null || value === undefined) continue;
-      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) out[key] = value;
-    }
-    for (const key of ['paymentMethod', 'carrier', 'billingPeriod']) {
-      const value = ai?.[key];
-      if (typeof value === 'string' && value.trim()) out[key] = value.trim().slice(0, 180);
-    }
-    if (Array.isArray(ai?.lineItems)) {
-      out.lineItems = ai.lineItems.slice(0, 12).filter(item =>
-        item && typeof item.description === 'string' && item.description.trim()
-      ).map(item => ({
-        description: item.description.trim().slice(0, 240),
-        quantity: Number.isFinite(item.quantity) && item.quantity > 0 ? item.quantity : null,
-        totalTTC: Number.isFinite(item.totalTTC) && item.totalTTC >= 0 ? item.totalTTC : null
-      }));
-    }
-    // Si l'IA indique explicitement un sous-total produits HT, sans HT global,
-    // on retire l'ancien HT hérité de l'OCR lorsque des frais de port sont séparés.
-    if (ai?.ht === null && out.shippingTTC > 0 &&
-        typeof out.itemsSubtotalHT === 'number' &&
-        Math.abs(Number(out.ht) - out.itemsSubtotalHT) < 0.02) {
+    if (ai.lineItems.length && ai.confidence.product >= 75) out.lineItems = ai.lineItems;
+    if (
+      ai.ht === null &&
+      out.shippingTTC > 0 &&
+      typeof out.itemsSubtotalHT === 'number' &&
+      out.ht === out.itemsSubtotalHT
+    )
       out.ht = null;
-    }
-
-    // La date principale de Recover utilise purchaseDate. Sur une facture magasin,
-    // la date de facture est le meilleur repli lorsqu'aucune date de commande/achat n'existe.
     if (fieldMissing(out.purchaseDate) && !fieldMissing(out.invoiceDate)) {
       out.purchaseDate = out.invoiceDate;
+      out.fieldSources.purchaseDate = out.fieldSources.invoiceDate || 'local';
+      out.fieldConfidence.purchaseDate = Math.min(80, out.fieldConfidence.invoiceDate || 75);
+      out.confidence.date = out.fieldConfidence.purchaseDate;
     }
-
-    // Quand le document ne distingue pas explicitement marchand et vendeur,
-    // le marchand confirmé par l'IA est un repli sûr pour « Vendu par ».
-    // Une place de marché n'est pas nécessairement le vendeur du produit.
-    // Ne jamais renseigner « Vendu par Amazon » si aucun vendeur explicite n'a été identifié.
-    const merchantNormalized = String(out.merchant || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-    const marketplace = /\b(?:amazon|cdiscount|fnac|rakuten|ebay|aliexpress|etsy|manomano|back market|vinted|la redoute)\b/.test(merchantNormalized);
-    if (fieldMissing(out.seller) && !fieldMissing(out.merchant) && !marketplace) {
-      out.seller = out.merchant;
-    }
-
-    out.confidence = { ...localConf };
-    if (conf.merchant) out.confidence.merchant = Math.max(out.confidence.merchant || 0, conf.merchant);
-    if (conf.product) out.confidence.product = Math.max(out.confidence.product || 0, conf.product);
-    if (conf.price) out.confidence.price = Math.max(out.confidence.price || 0, conf.price);
-    if (conf.purchaseDate || conf.invoiceDate) out.confidence.date = Math.max(out.confidence.date || 0, conf.purchaseDate || conf.invoiceDate || 0);
-    if (conf.orderNumber) out.confidence.order = Math.max(out.confidence.order || 0, conf.orderNumber);
-    if (fieldMissing(ai?.seller) && conf.merchant) out.confidence.seller = Math.max(out.confidence.seller || 0, conf.merchant);
-
-    out.enhanced = true;
     out.aiUsed = true;
-    out.aiModel = ai?.model || '';
-    out.aiEvidence = ai?.evidence || {};
-    out.enhancedNotes = ['Vérification par IA visuelle'];
-
-    // Après une analyse IA structurée, on évite de réafficher les paires OCR brutes
-    // qui mélangeaient colonnes, adresses et fragments. On conserve seulement des extras utiles.
+    out.aiModel = input.model || '';
+    out.aiEvidence = ai.evidence;
+    out.validationWarnings = ai.validationWarnings;
+    out.financialWarnings = validation.financialWarnings(out);
+    out.enhanced = false;
     const extras = [];
-    if (ai?.commercialWarrantyEnd) extras.push({ label: 'Garantie commerciale jusqu’au', value: formatDateFr(ai.commercialWarrantyEnd) });
-    if (ai?.legalWarrantyText) extras.push({ label: 'Garantie légale détectée', value: ai.legalWarrantyText });
+    if (out.commercialWarrantyEnd)
+      extras.push({ label: 'Garantie commerciale jusqu’au', value: formatDateFr(out.commercialWarrantyEnd) });
+    if (ai.legalWarrantyText && ai.confidence.legalWarrantyText >= 75)
+      extras.push({ label: 'Garantie légale détectée', value: ai.legalWarrantyText });
     out.genericFields = cleanGenericFields(extras);
-
     return applyManual(out);
   }
 
@@ -406,8 +386,11 @@
     if (!content || content.querySelector('.recover-ai-visual-banner')) return;
     const box = document.createElement('div');
     box.className = 'enhanced-box recover-ai-visual-banner';
-    const model = data?.model ? ` · ${data.model}` : '';
-    box.innerHTML = `<strong>✨ IA visuelle utilisée${model}</strong><p>Recover a comparé directement l’image de la facture avec l’analyse locale. Les champs absents du document restent vides au lieu d’être inventés.</p>`;
+    const title = document.createElement('strong');
+    title.textContent = 'Analyse visuelle effectuée' + (data?.model ? ' · ' + data.model : '');
+    const detail = document.createElement('p');
+    detail.textContent = 'Les informations ont été croisées avec la lecture locale. Vérifiez les champs signalés comme incertains.';
+    box.replaceChildren(title, detail);
     content.prepend(box);
   }
 
@@ -447,6 +430,7 @@
     if (!force && doneFingerprint === fp) return;
 
     let succeeded = false;
+    aiBusy = true;
     try {
       const text = typeof window.extractFile === 'function' ? await window.extractFile(file) : '';
       let local = window.RecoverParser?.parse ? window.RecoverParser.parse(text) : {};
@@ -455,7 +439,6 @@
       if (!force && !needsVisualFallback(local, text)) return;
       if (!requestAiConsent()) return;
 
-      aiBusy = true;
       const button = document.querySelector('#recover-ai-check');
       if (button) { button.disabled = true; button.textContent = '✨ IA visuelle en cours…'; }
       const content = document.querySelector('#result-content');
@@ -474,7 +457,7 @@
         fileName: file.name,
         mimeType: file.type,
         extractedText: String(text || '').slice(0, 24000),
-        localAnalysis: local,
+        localAnalysis: Object.fromEntries(Object.entries(local).filter(([key]) => key !== 'rawText')),
         images
       });
       const merged = mergeAi(local, { ...result.analysis, model: result.model });
@@ -482,7 +465,8 @@
       succeeded = true;
 
       const dlg = document.querySelector('#analysis-result-dialog');
-      if (dlg?.open) dlg.close();
+      if (fingerprint(document.querySelector('#file-input')?.files?.[0]) !== fp || !dlg?.open) return;
+      dlg.close();
       if (typeof window.showResult === 'function') {
         window.showResult(merged);
         await sleep(0);
@@ -492,6 +476,8 @@
     } catch (err) {
       console.error('Recover IA visuelle:', err);
       doneFingerprint = '';
+      if (fingerprint(document.querySelector('#file-input')?.files?.[0]) !== fp ||
+          !document.querySelector('#analysis-result-dialog')?.open) return;
       const content = document.querySelector('#result-content');
       if (content) {
         const banner = content.querySelector('#recover-ai-running') || document.createElement('div');
@@ -508,7 +494,7 @@
       if (button) { button.disabled = false; button.textContent = '✨ Réessayer avec l’IA visuelle'; }
     } finally {
       aiBusy = false;
-      if (succeeded) resetAiButton(true);
+      resetAiButton(succeeded);
     }
   }
 
